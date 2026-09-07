@@ -33,13 +33,14 @@ func main() {
 		outDir    = flag.String("o", ".", "destination directory")
 		workers   = flag.Int("w", 8, "concurrent downloads (capped at 20 by AndroZoo)")
 		indexPath = flag.String("index", os.Getenv("ANDROZOO_INDEX"), "path to latest.csv or latest.csv.gz (env ANDROZOO_INDEX)")
+		pkgExact  = flag.String("pkg-exact", "", "select on an exact package name")
 		pkgMatch  = flag.String("pkg-match", "", "select on a substring of the package name")
 		pkgRegex  = flag.String("pkg-regex", "", "select on a regular expression over the package name")
 		market    = flag.String("market", "", "select on a market, e.g. play.google.com")
 		from      = flag.String("from", "", "earliest dex date, YYYY-MM-DD")
 		to        = flag.String("to", "", "latest dex date, YYYY-MM-DD")
-		vtMin     = flag.Int("vt-min", -1, "minimum VirusTotal detection count")
-		vtMax     = flag.Int("vt-max", -1, "maximum VirusTotal detection count")
+		vtMin     = flag.Int("vt-min", -1, "minimum VirusTotal detection count (-1 to not constrain)")
+		vtMax     = flag.Int("vt-max", -1, "maximum VirusTotal detection count (-1 to not constrain)")
 		n         = flag.Int("n", 100, "max samples to select from the catalogue")
 		random    = flag.Bool("random", false, "draw a uniform sample among all matches instead of the first ones")
 		seed      = flag.Uint64("seed", 0, "seed for -random, so a selection can be reproduced")
@@ -101,6 +102,9 @@ func main() {
 		}
 		if *vtMax >= 0 {
 			f.VTMax = vtMax
+		}
+		if p := strings.TrimSpace(*pkgExact); p != "" {
+			f.PkgExact = []string{p}
 		}
 		res, err := svc.Search(ctx, f)
 		if err != nil {
