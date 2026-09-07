@@ -77,6 +77,115 @@ type DownloadResult struct {
 	Outcomes  []DownloadOutcome `json:"outcomes"`
 }
 
+// FetchResult describes a catalogue download.
+type FetchResult struct {
+	Path         string `json:"path"`
+	Bytes        int64  `json:"bytes_written"`
+	TotalSize    int64  `json:"total_size"`
+	Resumed      bool   `json:"resumed"`
+	LastModified string `json:"server_last_modified,omitempty"`
+	Note         string `json:"note,omitempty"`
+}
+
+// FetchIndex downloads the nightly catalogue to dest, resuming a previous
+// attempt when the server allows it. The transfer lands in dest+".part" and is
+// renamed only once complete, so an interrupted download never leaves a
+// half-written catalogue that would silently answer queries with a fraction of
+// the corpus.
+//
+// The file is upwards of 2.7 GB compressed and is rebuilt nightly, so a resumed
+// transfer can straddle two builds; the server refusing the range is how that
+// gets caught.
+func (s *Service) FetchIndex(ctx context.Context, dest string) (FetchResult, error) {
+	dest = strings.TrimSpace(dest)
+	if dest == "" {
+		return FetchResult{}, fmt.Errorf("no destination path for the catalogue")
+	}
+	if st, err := os.Stat(dest); err == nil && st.IsDir() {
+		dest = filepath.Join(dest, "latest.csv.gz")
+	}
+	if dir := filepath.Dir(dest); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return FetchResult{}, err
+		}
+	}
+
+	part := dest + ".part"
+	var offset int64
+	if st, err := os.Stat(part); err == nil {
+		offset = st.Size()
+	}
+
+	body, info, err := s.client.IndexReader(ctx, offset)
+	if err != nil {
+		return FetchResult{}, err
+	}
+	defer body.Close()
+
+	flags := os.O_CREATE | os.O_WRONLY
+	if info.Resumed {
+		flags |= os.O_APPEND
+	} else {
+		flags |= os.O_TRUNC
+		offset = 0
+	}
+	f, err := os.OpenFile(part, flags, 0o644)
+	if err != nil {
+		return FetchResult{}, err
+	}
+
+	n, copyErr := io.Copy(f, body)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return FetchResult{Path: part, Bytes: n, Resumed: info.Resumed},
+			fmt.Errorf("catalogue download interrupted after %d bytes (kept at %s, run again to resume): %w", n, part, copyErr)
+	}
+	if closeErr != nil {
+		return FetchResult{Path: part, Bytes: n}, closeErr
+	}
+
+	if err := verifyGzip(part, dest); err != nil {
+		return FetchResult{Path: part, Bytes: n}, err
+	}
+	if err := os.Rename(part, dest); err != nil {
+		return FetchResult{Path: part, Bytes: n}, err
+	}
+
+	res := FetchResult{
+		Path:         dest,
+		Bytes:        offset + n,
+		TotalSize:    info.TotalSize,
+		Resumed:      info.Resumed,
+		LastModified: info.LastModified,
+	}
+	if offset > 0 && !info.Resumed {
+		res.Note = "the server would not resume, so the file was downloaded from the start"
+	}
+	return res, nil
+}
+
+// verifyGzip checks the magic bytes rather than the size: a truncated transfer
+// and an HTML error page both produce a file, and only one of them is a
+// catalogue.
+func verifyGzip(part, dest string) error {
+	if !strings.HasSuffix(dest, ".gz") {
+		return nil
+	}
+	f, err := os.Open(part)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	var magic [2]byte
+	if _, err := io.ReadFull(f, magic[:]); err != nil {
+		return fmt.Errorf("downloaded catalogue is too short to be gzip: %w", err)
+	}
+	if magic[0] != 0x1f || magic[1] != 0x8b {
+		return fmt.Errorf("downloaded catalogue is not gzip (starts with %#x %#x): the server most likely returned an error page, and %s was kept for inspection", magic[0], magic[1], part)
+	}
+	return nil
+}
+
 func (s *Service) catalogue() Catalogue {
 	return Catalogue{
 		Path:     s.idx.Path(),
