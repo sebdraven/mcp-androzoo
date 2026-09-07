@@ -52,11 +52,9 @@ rather than answer from nothing.
 
 ## Getting the catalogue
 
-Nothing works without it, so both the CLI and the server can fetch it:
-
-```sh
-azdl -fetch-index ~/androzoo/latest.csv.gz
-```
+You don't. `azdl` fetches it on first use and caches it in
+`~/Library/Caches/androzoo/latest.csv.gz` (`$XDG_CACHE_HOME/androzoo` on
+Linux); `-index` overrides the location and `-refresh` forces a new copy.
 
 It is over 2.7 GB compressed, rebuilt nightly before 6am Luxembourg time, and
 served as a public static file — no key needed for this one. The transfer lands
@@ -65,15 +63,19 @@ in a `.part` file and is renamed only once complete, so a run interrupted at
 file never gets mistaken for a catalogue. If the server will not resume — its
 nightly rebuild landed in between — the download restarts and says so.
 
+The MCP server does not fetch on demand: a multi-minute download would outlast
+most clients' tool timeouts. It exposes `az_fetch_index` instead, and refuses
+the catalogue tools until one exists.
+
 ## azdl
 
 Bulk downloads, from a file of hashes or straight from a catalogue query.
 
 ```sh
-azdl -i hashes.txt -o ./apks -w 8
-azdl -index latest.csv.gz -pkg-exact com.duiyun.cocospy -o ./apks
-azdl -index latest.csv.gz -pkg-match cocospy -o ./apks -manifest selection.csv
-azdl -index latest.csv.gz -vt-max 0 -market play.google.com -n 500 -random -seed 42 -dry-run
+azdl -pkg-exact com.duiyun.cocospy -o ./apks
+azdl -pkg-match cocospy -manifest selection.csv -dry-run
+azdl -i selection.csv -o ./apks -w 8
+azdl -vt-max 0 -market play.google.com -n 500 -random -seed 42 -dry-run
 ```
 
 Each APK lands in a temporary file, is verified against its SHA-256 and only
