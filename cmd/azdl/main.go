@@ -1,24 +1,28 @@
 // Command azdl downloads APKs from AndroZoo in bulk: from a file of hashes, or
 // straight from a catalogue query.
 //
-//	azdl -i hashes.txt -o ./apks -w 8
-//	azdl -index latest.csv.gz -pkg-match cocospy -o ./apks
-//	azdl -index latest.csv.gz -vt-max 0 -market play.google.com -n 500 -random -dry-run
+//	azdl -pkg-match cocospy -n 500 -manifest cocospy.csv -dry-run
+//	azdl -i cocospy.csv -o ./apks -w 8
+//	azdl -vt-max 0 -market play.google.com -n 500 -random -dry-run
+//
+// The catalogue is fetched on first use if it is not on disk.
 package main
 
 import (
 	"bufio"
 	"context"
 	"encoding/csv"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/sebdraven/mcp-androzoo/internal/androzoo"
 	"github.com/sebdraven/mcp-androzoo/internal/index"
@@ -32,8 +36,8 @@ func main() {
 		input     = flag.String("i", "", "file of SHA-256 hashes, one per line ('-' for stdin)")
 		outDir    = flag.String("o", ".", "destination directory")
 		workers   = flag.Int("w", 8, "concurrent downloads (capped at 20 by AndroZoo)")
-		indexPath = flag.String("index", os.Getenv("ANDROZOO_INDEX"), "path to latest.csv or latest.csv.gz (env ANDROZOO_INDEX)")
-		fetchIdx  = flag.String("fetch-index", "", "download the AndroZoo catalogue to this path and exit (resumes an interrupted run)")
+		indexPath = flag.String("index", defaultIndexPath(), "catalogue file; downloaded here on first use if absent")
+		refresh   = flag.Bool("refresh", false, "re-download the catalogue even if it is already on disk")
 		pkgExact  = flag.String("pkg-exact", "", "select on an exact package name")
 		pkgMatch  = flag.String("pkg-match", "", "select on a substring of the package name")
 		pkgRegex  = flag.String("pkg-regex", "", "select on a regular expression over the package name")
@@ -59,31 +63,17 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	key, err := androzoo.Key()
+	if err != nil && !*dryRun {
+		log.Fatalf("%v", err)
+	}
+	client := androzoo.New(key)
+
 	var (
 		shas    []string
 		entries []index.Entry
 		svc     *service.Service
 	)
-
-	// The catalogue is a public static file, so fetching it needs no key.
-	key, err := androzoo.Key()
-	if err != nil && !*dryRun && *fetchIdx == "" {
-		log.Fatalf("%v", err)
-	}
-
-	if *fetchIdx != "" {
-		res, err := service.New(androzoo.New(key), nil, "").FetchIndex(ctx, *fetchIdx)
-		if err != nil {
-			log.Fatalf("%v", err)
-		}
-		if res.Note != "" {
-			log.Printf("note: %s", res.Note)
-		}
-		log.Printf("catalogue written to %s (%d MB, server date %s)%s",
-			res.Path, res.Bytes/(1024*1024), res.LastModified, resumedSuffix(res.Resumed))
-		log.Printf("pass it with -index %s", res.Path)
-		return
-	}
 
 	switch {
 	case *input != "":
@@ -91,17 +81,14 @@ func main() {
 		if err != nil {
 			log.Fatalf("%v", err)
 		}
-		svc = service.New(androzoo.New(key), nil, *outDir)
+		svc = service.New(client, nil, *outDir)
 
 	default:
-		if strings.TrimSpace(*indexPath) == "" {
-			log.Fatalf("nothing to download: pass -i with a file of hashes, or -index with a catalogue and selection flags")
-		}
-		ix, err := index.Open(*indexPath)
+		ix, err := catalogue(ctx, client, *indexPath, *refresh)
 		if err != nil {
 			log.Fatalf("%v", err)
 		}
-		svc = service.New(androzoo.New(key), ix, *outDir)
+		svc = service.New(client, ix, *outDir)
 
 		f := index.Filter{
 			PkgMatch:    *pkgMatch,
@@ -130,9 +117,8 @@ func main() {
 		for _, e := range entries {
 			shas = append(shas, e.SHA256)
 		}
-		log.Printf("catalogue %s (%d MB, %s): %d rows scanned, %d matched, %d selected in %s",
-			res.Catalogue.Path, res.Catalogue.SizeMB, res.Catalogue.Modified,
-			res.Stats.Scanned, res.Stats.Matched, res.Stats.Returned, res.Stats.Elapsed.Round(time.Millisecond))
+		log.Printf("%d rows scanned, %d matched, %d selected in %s",
+			res.Stats.Scanned, res.Stats.Matched, res.Stats.Returned, res.Stats.Elapsed.Round(1e6))
 		if res.Note != "" {
 			log.Printf("note: %s", res.Note)
 		}
@@ -170,15 +156,42 @@ func main() {
 	}
 }
 
-func resumedSuffix(resumed bool) string {
-	if resumed {
-		return ", resumed"
+// defaultIndexPath keeps the catalogue out of the working directory: it is
+// nearly 3 GB and shared by every invocation.
+func defaultIndexPath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return "latest.csv.gz"
 	}
-	return ""
+	return filepath.Join(dir, "androzoo", "latest.csv.gz")
+}
+
+// catalogue opens the catalogue, downloading it first when it is missing. The
+// download is resumable, so an interrupted first run costs nothing to retry.
+func catalogue(ctx context.Context, c *androzoo.Client, path string, refresh bool) (*index.Index, error) {
+	_, statErr := os.Stat(path)
+	missing := errors.Is(statErr, fs.ErrNotExist)
+
+	if missing || refresh {
+		if refresh && !missing {
+			if err := os.Remove(path); err != nil {
+				return nil, err
+			}
+			log.Printf("refreshing the catalogue at %s", path)
+		} else {
+			log.Printf("no catalogue at %s — fetching it (about 2.7 GB, resumable)", path)
+		}
+		res, err := service.New(c, nil, "").FetchIndex(ctx, path)
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("catalogue ready: %s, %d MB, server date %s", res.Path, res.Bytes/(1024*1024), res.LastModified)
+	}
+	return index.Open(path)
 }
 
 // readHashes accepts a bare list of hashes or the first column of a CSV, which
-// is what a catalogue extract looks like.
+// is what a manifest looks like.
 func readHashes(path string) ([]string, error) {
 	var rc *os.File
 	if path == "-" {
