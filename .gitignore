@@ -14,3 +14,12 @@ bin/
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+
+# Working files: hash lists, manifests, catalogue extracts
+*.txt
+*.csv
+*.csv.gz
+*.part
+
+# Downloaded samples
+apks/
