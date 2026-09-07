@@ -53,6 +53,13 @@ func Register(s *mcp.Server, svc *service.Service) {
 	}, r.gpMetadata)
 
 	mcp.AddTool(s, &mcp.Tool{
+		Name: "az_fetch_index",
+		Description: "Download the AndroZoo catalogue (latest.csv.gz) to a path on this machine — the prerequisite for az_lookup, az_search and az_versions. " +
+			"The file is over 2.7 GB compressed and rebuilt nightly, so this takes minutes and may outlast an MCP client's timeout; an interrupted run resumes where it stopped when called again. " +
+			"The server must be restarted with -index pointing at the result before the catalogue tools will see it.",
+	}, r.fetchIndex)
+
+	mcp.AddTool(s, &mcp.Tool{
 		Name: "az_download",
 		Description: "Download APKs by SHA-256 into a directory on this machine. " +
 			"Each file is verified against its hash before it takes its final name, and hashes already present are skipped. " +
@@ -89,6 +96,10 @@ type versionsInput struct {
 type gpInput struct {
 	Package string `json:"package" jsonschema:"exact package name"`
 	VerCode *int64 `json:"vercode,omitempty" jsonschema:"one version code; omit for every record on the package"`
+}
+
+type fetchIndexInput struct {
+	Path string `json:"path" jsonschema:"where to write the catalogue; a directory gets latest.csv.gz inside it"`
 }
 
 type downloadInput struct {
@@ -137,6 +148,14 @@ func (r *registry) gpMetadata(ctx context.Context, _ *mcp.CallToolRequest, in gp
 		return nil, service.GPResult{}, fmt.Errorf("package is required")
 	}
 	res, err := r.svc.GPMetadata(ctx, in.Package, in.VerCode)
+	return nil, res, err
+}
+
+func (r *registry) fetchIndex(ctx context.Context, _ *mcp.CallToolRequest, in fetchIndexInput) (*mcp.CallToolResult, service.FetchResult, error) {
+	if strings.TrimSpace(in.Path) == "" {
+		return nil, service.FetchResult{}, fmt.Errorf("path is required")
+	}
+	res, err := r.svc.FetchIndex(ctx, in.Path)
 	return nil, res, err
 }
 
