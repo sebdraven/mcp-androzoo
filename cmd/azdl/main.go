@@ -33,6 +33,7 @@ func main() {
 		outDir    = flag.String("o", ".", "destination directory")
 		workers   = flag.Int("w", 8, "concurrent downloads (capped at 20 by AndroZoo)")
 		indexPath = flag.String("index", os.Getenv("ANDROZOO_INDEX"), "path to latest.csv or latest.csv.gz (env ANDROZOO_INDEX)")
+		fetchIdx  = flag.String("fetch-index", "", "download the AndroZoo catalogue to this path and exit (resumes an interrupted run)")
 		pkgExact  = flag.String("pkg-exact", "", "select on an exact package name")
 		pkgMatch  = flag.String("pkg-match", "", "select on a substring of the package name")
 		pkgRegex  = flag.String("pkg-regex", "", "select on a regular expression over the package name")
@@ -64,9 +65,24 @@ func main() {
 		svc     *service.Service
 	)
 
+	// The catalogue is a public static file, so fetching it needs no key.
 	key, err := androzoo.Key()
-	if err != nil && !*dryRun {
+	if err != nil && !*dryRun && *fetchIdx == "" {
 		log.Fatalf("%v", err)
+	}
+
+	if *fetchIdx != "" {
+		res, err := service.New(androzoo.New(key), nil, "").FetchIndex(ctx, *fetchIdx)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		if res.Note != "" {
+			log.Printf("note: %s", res.Note)
+		}
+		log.Printf("catalogue written to %s (%d MB, server date %s)%s",
+			res.Path, res.Bytes/(1024*1024), res.LastModified, resumedSuffix(res.Resumed))
+		log.Printf("pass it with -index %s", res.Path)
+		return
 	}
 
 	switch {
@@ -152,6 +168,13 @@ func main() {
 	if res.Failed > 0 {
 		os.Exit(1)
 	}
+}
+
+func resumedSuffix(resumed bool) string {
+	if resumed {
+		return ", resumed"
+	}
+	return ""
 }
 
 // readHashes accepts a bare list of hashes or the first column of a CSV, which
