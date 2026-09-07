@@ -87,6 +87,31 @@ type FetchResult struct {
 	Note         string `json:"note,omitempty"`
 }
 
+// ProgressFunc is called periodically during a catalogue download with the
+// bytes written so far and the total when the server reported one (0 if not).
+type ProgressFunc func(written, total int64)
+
+// progressWriter counts bytes on their way to the file. It deliberately does
+// not implement ReaderFrom: io.Copy would take that shortcut and bypass the
+// counting entirely.
+type progressWriter struct {
+	w     io.Writer
+	done  int64
+	total int64
+	fn    ProgressFunc
+	last  time.Time
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n, err := p.w.Write(b)
+	p.done += int64(n)
+	if time.Since(p.last) >= 200*time.Millisecond {
+		p.last = time.Now()
+		p.fn(p.done, p.total)
+	}
+	return n, err
+}
+
 // FetchIndex downloads the nightly catalogue to dest, resuming a previous
 // attempt when the server allows it. The transfer lands in dest+".part" and is
 // renamed only once complete, so an interrupted download never leaves a
@@ -97,6 +122,12 @@ type FetchResult struct {
 // transfer can straddle two builds; the server refusing the range is how that
 // gets caught.
 func (s *Service) FetchIndex(ctx context.Context, dest string) (FetchResult, error) {
+	return s.FetchIndexProgress(ctx, dest, nil)
+}
+
+// FetchIndexProgress is FetchIndex with a progress callback. onProgress may be
+// nil, and is called from the copying goroutine, so it should return quickly.
+func (s *Service) FetchIndexProgress(ctx context.Context, dest string, onProgress ProgressFunc) (FetchResult, error) {
 	dest = strings.TrimSpace(dest)
 	if dest == "" {
 		return FetchResult{}, fmt.Errorf("no destination path for the catalogue")
@@ -135,7 +166,14 @@ func (s *Service) FetchIndex(ctx context.Context, dest string) (FetchResult, err
 		return FetchResult{}, err
 	}
 
-	n, copyErr := io.Copy(f, body)
+	var dst io.Writer = f
+	if onProgress != nil {
+		// done starts at the resumed offset so the bar reports position in the
+		// whole file, not in this leg of the transfer.
+		dst = &progressWriter{w: f, done: offset, total: info.TotalSize, fn: onProgress}
+	}
+
+	n, copyErr := io.Copy(dst, body)
 	closeErr := f.Close()
 	if copyErr != nil {
 		return FetchResult{Path: part, Bytes: n, Resumed: info.Resumed},
@@ -143,6 +181,10 @@ func (s *Service) FetchIndex(ctx context.Context, dest string) (FetchResult, err
 	}
 	if closeErr != nil {
 		return FetchResult{Path: part, Bytes: n}, closeErr
+	}
+
+	if onProgress != nil {
+		onProgress(offset+n, info.TotalSize)
 	}
 
 	if err := verifyGzip(part, dest); err != nil {
