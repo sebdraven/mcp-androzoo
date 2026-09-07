@@ -115,6 +115,7 @@ func (s *Service) FetchIndex(ctx context.Context, dest string) (FetchResult, err
 	if st, err := os.Stat(part); err == nil {
 		offset = st.Size()
 	}
+	requested := offset
 
 	body, info, err := s.client.IndexReader(ctx, offset)
 	if err != nil {
@@ -158,7 +159,7 @@ func (s *Service) FetchIndex(ctx context.Context, dest string) (FetchResult, err
 		Resumed:      info.Resumed,
 		LastModified: info.LastModified,
 	}
-	if offset > 0 && !info.Resumed {
+	if requested > 0 && !info.Resumed {
 		res.Note = "the server would not resume, so the file was downloaded from the start"
 	}
 	return res, nil
