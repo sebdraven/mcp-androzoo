@@ -1,6 +1,8 @@
 package service
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -320,5 +322,185 @@ func TestGPMetadataCarriesFetchTime(t *testing.T) {
 	}
 	if len(res.Records) != 1 {
 		t.Errorf("got %d records, want 1", len(res.Records))
+	}
+}
+
+// gzipBody is a valid gzip stream, so the magic-byte check passes.
+func gzipBody(t *testing.T, payload string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := w.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// catalogueServer serves body at the catalogue path, honouring Range only when
+// allowRange is set, and records the Range header it saw.
+func catalogueServer(t *testing.T, body []byte, allowRange bool, sawRange *string) *androzoo.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != androzoo.IndexPath {
+			http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		rng := r.Header.Get("Range")
+		if sawRange != nil {
+			*sawRange = rng
+		}
+		w.Header().Set("Last-Modified", "Mon, 07 Sep 2026 05:00:00 GMT")
+		if rng == "" || !allowRange {
+			w.Write(body)
+			return
+		}
+		var off int64
+		fmt.Sscanf(rng, "bytes=%d-", &off)
+		if off > int64(len(body)) {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", off, len(body)-1, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(body[off:])
+	}))
+	t.Cleanup(srv.Close)
+	return androzoo.New("", androzoo.WithBaseURL(srv.URL))
+}
+
+func TestFetchIndexWritesCatalogue(t *testing.T) {
+	body := gzipBody(t, "sha256,sha1,md5\n")
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "latest.csv.gz")
+	svc := New(catalogueServer(t, body, true, nil), nil, dir)
+
+	res, err := svc.FetchIndex(context.Background(), dest)
+	if err != nil {
+		t.Fatalf("FetchIndex: %v", err)
+	}
+	if res.Bytes != int64(len(body)) {
+		t.Errorf("Bytes = %d, want %d", res.Bytes, len(body))
+	}
+	if res.Resumed {
+		t.Error("Resumed = true on a fresh download")
+	}
+	if res.LastModified == "" {
+		t.Error("LastModified is empty: it is the only thing telling two nightly builds apart")
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("reading the catalogue: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Error("catalogue content differs from what was served")
+	}
+	if _, err := os.Stat(dest + ".part"); !os.IsNotExist(err) {
+		t.Error("the .part file survived a successful download")
+	}
+}
+
+func TestFetchIndexResumes(t *testing.T) {
+	body := gzipBody(t, strings.Repeat("row\n", 200))
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "latest.csv.gz")
+
+	half := len(body) / 2
+	if err := os.WriteFile(dest+".part", body[:half], 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var sawRange string
+	svc := New(catalogueServer(t, body, true, &sawRange), nil, dir)
+
+	res, err := svc.FetchIndex(context.Background(), dest)
+	if err != nil {
+		t.Fatalf("FetchIndex: %v", err)
+	}
+	if sawRange != fmt.Sprintf("bytes=%d-", half) {
+		t.Errorf("Range header = %q, want a resume at %d", sawRange, half)
+	}
+	if !res.Resumed {
+		t.Error("Resumed = false although the server honoured the range")
+	}
+	if res.Bytes != int64(len(body)) {
+		t.Errorf("Bytes = %d, want the whole file (%d)", res.Bytes, len(body))
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Error("the resumed file does not match the original: the halves were not joined correctly")
+	}
+}
+
+func TestFetchIndexRestartsWhenRangeRefused(t *testing.T) {
+	body := gzipBody(t, strings.Repeat("row\n", 200))
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "latest.csv.gz")
+
+	// A partial file left over from a different, older nightly build.
+	if err := os.WriteFile(dest+".part", []byte("stale bytes from yesterday"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svc := New(catalogueServer(t, body, false, nil), nil, dir)
+
+	res, err := svc.FetchIndex(context.Background(), dest)
+	if err != nil {
+		t.Fatalf("FetchIndex: %v", err)
+	}
+	if res.Resumed {
+		t.Error("Resumed = true although the server ignored the range")
+	}
+	if res.Note == "" {
+		t.Error("a silent restart carried no note")
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Error("stale bytes survived a restart: the .part file was appended to instead of truncated")
+	}
+}
+
+func TestFetchIndexRejectsNonGzip(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "latest.csv.gz")
+	svc := New(catalogueServer(t, []byte("<html>rate limited</html>"), true, nil), nil, dir)
+
+	_, err := svc.FetchIndex(context.Background(), dest)
+	if err == nil {
+		t.Fatal("an HTML error page was accepted as a catalogue")
+	}
+	if !strings.Contains(err.Error(), "not gzip") {
+		t.Errorf("error = %v, want a gzip complaint", err)
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Error("a rejected download was renamed into place anyway")
+	}
+}
+
+func TestFetchIndexIntoDirectory(t *testing.T) {
+	body := gzipBody(t, "sha256\n")
+	dir := t.TempDir()
+	svc := New(catalogueServer(t, body, true, nil), nil, dir)
+
+	res, err := svc.FetchIndex(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("FetchIndex: %v", err)
+	}
+	if filepath.Base(res.Path) != "latest.csv.gz" {
+		t.Errorf("Path = %q, want latest.csv.gz inside the directory", res.Path)
+	}
+}
+
+func TestFetchIndexNeedsAPath(t *testing.T) {
+	svc := New(stub(t, nil), nil, t.TempDir())
+	if _, err := svc.FetchIndex(context.Background(), "  "); err == nil {
+		t.Error("an empty destination was accepted")
 	}
 }
