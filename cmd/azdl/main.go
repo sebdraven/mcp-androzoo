@@ -26,6 +26,7 @@ import (
 
 	"github.com/sebdraven/mcp-androzoo/internal/androzoo"
 	"github.com/sebdraven/mcp-androzoo/internal/index"
+	"github.com/sebdraven/mcp-androzoo/internal/progress"
 	"github.com/sebdraven/mcp-androzoo/internal/service"
 )
 
@@ -181,7 +182,9 @@ func catalogue(ctx context.Context, c *androzoo.Client, path string, refresh boo
 		} else {
 			log.Printf("no catalogue at %s — fetching it (about 2.7 GB, resumable)", path)
 		}
-		res, err := service.New(c, nil, "").FetchIndex(ctx, path)
+		bar := progress.NewBar()
+		res, err := service.New(c, nil, "").FetchIndexProgress(ctx, path, bar.Update)
+		bar.Done()
 		if err != nil {
 			return nil, err
 		}
